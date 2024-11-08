@@ -68,10 +68,11 @@ async fn handle_connection(connection: Connection, node_id: NodeId) -> Result<()
         "Direct UDP"
     };
 
-    info!("Remote address: {}", remote_addr);
-    info!("Latency: {}ms", latency);
-    info!("Connection type: {}", conn_type);
-    info!("Connection details: {:?}", connection);
+    info!("Connection from node: {}", node_id);
+    info!(" - Remote address: {}", remote_addr);
+    info!(" - Latency: {}ms", latency);
+    info!(" - Connection type: {}", conn_type);
+    debug!(" - Connection details: {:?}", connection);
 
     let start = Instant::now();
     debug!("Accepting bidirectional stream...");
@@ -205,10 +206,10 @@ async fn run_ping(args: ConnectArgs) -> Result<()> {
     let remote_addr = connection.remote_address();
     let latency = connection.rtt().as_millis();
 
-    info!("Connected to {}", args.node_id);
-    info!("Remote address: {}", remote_addr);
-    info!("Latency: {}ms", latency);
-    info!("Connection details: {:?}", connection);
+    info!(" - Connected to {}", args.node_id);
+    info!(" - Remote address: {}", remote_addr);
+    info!(" - Latency: {}ms", latency);
+    debug!("Connection details: {:?}", connection);
 
     let start = Instant::now();
     debug!("Opening bidirectional stream...");
