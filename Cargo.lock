@@ -2295,7 +2295,6 @@ dependencies = [
  "clap",
  "futures-lite 2.5.0",
  "iroh",
- "iroh-net",
  "tokio",
  "tracing",
  "tracing-subscriber",

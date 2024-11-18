@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_lite::StreamExt;
-use iroh_net::{
+use iroh::net::{
     endpoint::Connection,
     key::SecretKey,
     relay::{RelayMode, RelayUrl},
@@ -20,7 +20,7 @@ const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Parser)]
 struct ConnectArgs {
     #[clap(long)]
-    node_id: iroh_net::NodeId,
+    node_id: iroh::net::NodeId,
 
     #[clap(long, value_parser, num_args = 1.., value_delimiter = ' ')]
     addrs: Vec<SocketAddr>,
@@ -113,6 +113,7 @@ async fn run_listener() -> Result<()> {
     info!("Ping-Pong Listener starting...");
 
     let secret_key = SecretKey::generate();
+    let id = secret_key.public();
     info!(" - Secret key: {secret_key}");
 
     let endpoint = Endpoint::builder()
@@ -149,6 +150,7 @@ async fn run_listener() -> Result<()> {
     info!("RUST_LOG=\"irohping=info,iroh_net=none\" cargo run -- ping --addrs \"{local_addrs}\" --relay-url {relay_url} --node-id {me}");
     info!("# Without relay (direct UDP only):");
     info!("RUST_LOG=\"irohping=info,iroh_net=none\" cargo run -- ping --addrs \"{local_addrs}\" --node-id {me}");
+    info!("RUST_LOG=\"irohping=info,iroh_net=none\" cargo run -- ping --node-id {me}");
 
     while let Some(incoming) = endpoint.accept().await {
         let connecting = match incoming.accept() {
@@ -160,7 +162,7 @@ async fn run_listener() -> Result<()> {
         };
 
         let connection = connecting.await?;
-        let node_id = iroh_net::endpoint::get_remote_node_id(&connection)?;
+        let node_id = iroh::net::endpoint::get_remote_node_id(&connection)?;
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(connection, node_id).await {
@@ -183,12 +185,21 @@ async fn run_ping(args: ConnectArgs) -> Result<()> {
         .bind()
         .await?;
 
+    let relay_url = endpoint.watch_home_relay().next().await;
+
+    // .home_relay()
+    // .expect("should be connected to a relay server");
+
     let me = endpoint.node_id();
     info!(" - Our node ID: {me}");
+    info!(
+        " - Our relay URL: {}",
+        relay_url.as_ref().map(|url| url.as_str()).unwrap_or("None")
+    );
 
     debug!(" - Connecting to addresses: {:?}", args.addrs);
 
-    let addr = NodeAddr::from_parts(args.node_id, args.relay_url.clone(), args.addrs);
+    let addr = NodeAddr::from_parts(args.node_id, relay_url.clone(), args.addrs);
     info!(
         " - Connection mode: {}",
         if args.relay_url.is_some() {
@@ -202,7 +213,7 @@ async fn run_ping(args: ConnectArgs) -> Result<()> {
     let connection = endpoint.connect(addr, PING_PONG_ALPN).await?;
     debug!("Connection established");
 
-    let node_id = iroh_net::endpoint::get_remote_node_id(&connection)?;
+    let node_id = iroh::net::endpoint::get_remote_node_id(&connection)?;
     let remote_addr = connection.remote_address();
     let latency = connection.rtt().as_millis();
 
