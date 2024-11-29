@@ -4,18 +4,22 @@ use futures_lite::StreamExt;
 use iroh::net::{
     endpoint::Connection,
     key::SecretKey,
-    relay::{RelayMode, RelayUrl},
+    relay::{RelayMap, RelayMode, RelayUrl},
     Endpoint, NodeAddr, NodeId,
 };
 use std::{
     net::SocketAddr,
     time::{Duration, Instant},
 };
+use tokio::select;
+use tokio::signal::ctrl_c;
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 pub const PING_PONG_ALPN: &[u8] = b"golem/ping-pong/0";
-const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
+const TIMEOUT_DURATION: Duration = Duration::from_secs(2);
+const PING_INTERVAL: Duration = Duration::from_secs(1);
+const MESSAGE_SIZE: usize = 4;
 
 #[derive(Debug, Clone, Parser)]
 struct ConnectArgs {
@@ -72,33 +76,65 @@ async fn handle_connection(connection: Connection, node_id: NodeId) -> Result<()
     info!(" - Remote address: {}", remote_addr);
     info!(" - Latency: {}ms", latency);
     info!(" - Connection type: {}", conn_type);
-    debug!(" - Connection details: {:?}", connection);
+    // debug!(" - Connection details: {:?}", connection);
 
-    let start = Instant::now();
     debug!("Accepting bidirectional stream...");
     let (mut send, mut recv) = connection.accept_bi().await?;
     debug!("Bidirectional stream accepted");
 
-    debug!("Waiting for ping message...");
-    let msg = recv.read_to_end(100).await?;
-    debug!("Received raw message of {} bytes", msg.len());
-    let msg = String::from_utf8(msg)?;
-    info!("📨 Received from {}: {}", node_id, msg);
-
-    debug!("Preparing pong response...");
     let response = "pong".to_string();
-    debug!("Sending pong...");
-    send.write_all(response.as_bytes()).await?;
+    let mut buffer = vec![0u8; MESSAGE_SIZE];
+    let mut error = false;
+
+    loop {
+        debug!("Waiting for message");
+        let start = Instant::now();
+        select! {
+            result = recv.read_exact(&mut buffer) => {
+                match result {
+                    Ok(_) => {
+                        let msg = String::from_utf8_lossy(&buffer);
+                        if msg.is_empty() {
+                            continue;
+                        }
+                        info!("📨 Received from {}: {}", node_id, msg);
+
+                        debug!("Preparing pong response...");
+                        debug!("Sending pong...");
+                        send.write_all(response.as_bytes()).await?;
+
+                        info!("📤 Sent to {}: {}", node_id, response);
+
+                        let elapsed = start.elapsed();
+                        info!(
+                            "Round-trip completed in {:.2}ms",
+                            elapsed.as_secs_f64() * 1000.0
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to read message: {}", e);
+                        error = true;
+                        break;
+                    }
+                }
+            }
+
+            _ = ctrl_c() => {
+                info!("Received shutdown signal, closing connection...");
+                break;
+            }
+        }
+    }
+
+    if error {
+        debug!("Error occurred, returning early");
+        return Ok(());
+    }
+
     debug!("Finishing send stream...");
     send.finish()?;
-    info!("📤 Sent to {}: {}", node_id, response);
 
-    let elapsed = start.elapsed();
-    info!(
-        "Round-trip completed in {:.2}ms",
-        elapsed.as_secs_f64() * 1000.0
-    );
-
+    debug!("Closing connection...");
     if (tokio::time::timeout(TIMEOUT_DURATION, connection.closed()).await).is_err() {
         debug!(
             "Connection didn't close within {}s timeout",
@@ -113,13 +149,16 @@ async fn run_listener() -> Result<()> {
     info!("Ping-Pong Listener starting...");
 
     let secret_key = SecretKey::generate();
-    let id = secret_key.public();
     info!(" - Secret key: {secret_key}");
+
+    let url = url::Url::parse("http://13.61.14.17:3340")?;
+    let relay_url = RelayUrl::from(url);
+    let relay_map = RelayMap::from_url(relay_url);
 
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
         .alpns(vec![PING_PONG_ALPN.to_vec()])
-        .relay_mode(RelayMode::Default)
+        .relay_mode(RelayMode::Custom(relay_map))
         .bind()
         .await?;
 
@@ -220,31 +259,62 @@ async fn run_ping(args: ConnectArgs) -> Result<()> {
     info!(" - Connected to {}", args.node_id);
     info!(" - Remote address: {}", remote_addr);
     info!(" - Latency: {}ms", latency);
-    debug!("Connection details: {:?}", connection);
+    // debug!(" - Connection details: {:?}", connection);
 
-    let start = Instant::now();
     debug!("Opening bidirectional stream...");
     let (mut send, mut recv) = connection.open_bi().await?;
     debug!("Bidirectional stream opened");
 
+    let mut interval = tokio::time::interval(PING_INTERVAL);
+
     let message = "ping".to_string();
-    debug!("Sending ping...");
-    send.write_all(message.as_bytes()).await?;
+    let mut buffer = vec![0u8; MESSAGE_SIZE];
+
+    loop {
+        select! {
+            _ = interval.tick() => {
+                let start = Instant::now();
+
+                debug!("Sending ping...");
+                if let Err(e) = send.write_all(message.as_bytes()).await {
+                    error!("Failed to send ping: {}", e);
+                    break;
+                }
+
+                info!("📤 Sent to {}: {}", node_id, message);
+
+                debug!("Waiting for pong response...");
+                match recv.read_exact(&mut buffer).await {
+                    Ok(_) => {
+                        let response = String::from_utf8_lossy(&buffer);
+                        if response.is_empty() {
+                            continue;
+                        }
+                        info!("📨 Received from {}: {}", node_id, response);
+                    }
+                    Err(e) => {
+                        error!("Failed to read pong response: {}", e);
+                        break;
+                    }
+                }
+
+                let elapsed = start.elapsed();
+                info!(
+                    "Round-trip completed in {:.2}ms",
+                    elapsed.as_secs_f64() * 1000.0
+                );
+            }
+            _ = ctrl_c() => {
+                info!("Received shutdown signal, closing connection...");
+                break;
+            }
+        }
+    }
+
     debug!("Finishing send stream...");
-    send.finish()?;
-    info!("📤 Sent to {}: {}", node_id, message);
-
-    debug!("Waiting for pong response...");
-    let response = recv.read_to_end(100).await?;
-    debug!("Received raw response of {} bytes", response.len());
-    let response = String::from_utf8(response)?;
-    info!("📨 Received from {}: {}", node_id, response);
-
-    let elapsed = start.elapsed();
-    info!(
-        "Round-trip completed in {:.2}ms",
-        elapsed.as_secs_f64() * 1000.0
-    );
+    if let Err(e) = send.finish() {
+        error!("Failed to finish send stream: {}", e);
+    }
 
     debug!("Closing endpoint...");
     endpoint.close(0u8.into(), b"bye").await?;
